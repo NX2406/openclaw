@@ -129,7 +129,7 @@
 
 ```bash
 # 方式 1: 在线运行（推荐）
-bash <(curl -fsSL https://raw.githubusercontent.com/NX2406/openclaw-uninstaller/main/openclaw-manager-all.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/NX2406/openclaw/refs/heads/main/openclaw-manager-all.sh)
 
 # 方式 2: 下载后运行
 wget https://raw.githubusercontent.com/NX2406/openclaw-uninstaller/main/openclaw-manager-all.sh
