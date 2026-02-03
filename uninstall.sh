@@ -6,7 +6,7 @@
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 #
 # 使用方法:
-#   curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/openclaw-uninstaller/main/uninstall.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/NX2406/openclaw-uninstaller/main/uninstall.sh | bash
 #   或者下载后执行: bash uninstall.sh
 #
 # 支持的卸载项目:
