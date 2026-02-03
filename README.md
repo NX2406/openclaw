@@ -20,14 +20,14 @@
 ### 一键运行 (推荐)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/openclaw-uninstaller/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/NX2406/openclaw-uninstaller/main/uninstall.sh | bash
 ```
 
 ### 下载后运行
 
 ```bash
 # 下载脚本
-curl -O https://raw.githubusercontent.com/YOUR_USERNAME/openclaw-uninstaller/main/uninstall.sh
+curl -O https://raw.githubusercontent.com/NX2406/openclaw-uninstaller/main/uninstall.sh
 
 # 添加执行权限
 chmod +x uninstall.sh
@@ -177,4 +177,3 @@ sudo systemctl start docker
 
 ---
 
-**提示**: 请将 `YOUR_USERNAME` 替换为您的 GitHub 用户名。
