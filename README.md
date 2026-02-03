@@ -20,7 +20,7 @@
 ### 一键运行 (推荐)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NX2406/openclaw-uninstaller/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/NX2406/openclaw/refs/heads/main/uninstall.sh | bash
 ```
 
 ### 下载后运行
@@ -178,3 +178,4 @@ sudo systemctl start docker
 ---
 
 **GitHub Repo**: [NX2406/openclaw-uninstaller](https://github.com/NX2406/openclaw-uninstaller)
+
