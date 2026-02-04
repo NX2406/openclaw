@@ -20,7 +20,7 @@
 ## 📦 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/NX2406/openclaw-manager/main/openclaw_manager.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/NX2406/openclaw/refs/heads/main/openclaw_manager.sh)
 ```
 
 或者：
@@ -135,3 +135,4 @@ MIT License
 <p align="center">
   <sub>Made with ❤️ by NX2406</sub>
 </p>
+
