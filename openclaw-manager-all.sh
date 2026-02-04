@@ -3,14 +3,14 @@
 # OpenClaw 完整管理工具（官方标准 + 交互式菜单）
 # ------------------------------------------------------------------------------
 # 目标：
-# 1) 保留“原来的那种交互式菜单”体验（主菜单 + 子菜单）
+# 1) 保留"原来的那种交互式菜单"体验（主菜单 + 子菜单）
 # 2) 认证/模型（尤其 Codex OAuth）全部以 OpenClaw 官方 CLI 为准
 # 3) Telegram 配置与 Pairing 审批以官方配置键与命令为准
 # 4) 多账号管理模式：
 #    - ✅ 采用「单一 agent（main）内的多 profile」方式（openai-codex:default / openai-codex:alt ...）
 #    - ✅ 通过 auth order 做默认优先顺序/故障切换
 #    - ✅ 通过 /model <provider/model>@<profileId> 做会话级固定账号
-#    - ❌ 不再引导使用多个 agent 作为多账号隔离（避免“登录了但找不到账号”的困扰）
+#    - ❌ 不再引导使用多个 agent 作为多账号隔离（避免"登录了但找不到账号"的困扰）
 #
 # 官方参考（关键点）：
 # - Token 存储：按 agent 隔离，auth-profiles.json 位于：
@@ -119,24 +119,15 @@ ok() { echo -e " ${GREEN}✓${NC} $*"; log "OK: $*"; }
 warn() { echo -e " ${YELLOW}!${NC} $*"; log "WARN: $*"; }
 err() { echo -e " ${RED}✗${NC} $*"; log "ERR: $*"; }
 
-# 交互回到菜单：默认最多等几秒，避免某些远程/无可用 TTY 的环境“看起来卡住”
-PRESS_ANY_KEY_TIMEOUT_SEC="${PRESS_ANY_KEY_TIMEOUT_SEC:-3}"
+# 交互回到菜单：按任意键返回（无超时）。
+# 说明：如果没有可交互 TTY（例如被管道调用/某些面板环境），就直接返回，避免死等。
 press_any_key() {
   echo ""
-  # 没有可交互 TTY 时，直接返回（不阻塞）
   if [[ ! -e "$TTY" ]]; then
     return 0
   fi
-  # 0 表示不等待（立刻返回）
-  if [[ "${PRESS_ANY_KEY_TIMEOUT_SEC}" == "0" ]]; then
-    return 0
-  fi
-  # 有些环境 read -t 不支持（极少见），失败则降级为普通 read
-  if read -r -n 1 -s -t "${PRESS_ANY_KEY_TIMEOUT_SEC}" -p " 按任意键返回菜单...（${PRESS_ANY_KEY_TIMEOUT_SEC}s 后自动返回）" <"$TTY"; then
-    echo ""
-  else
-    echo ""
-  fi
+  read -r -n 1 -s -p " 按任意键返回菜单..." <"$TTY" || true
+  echo ""
 }
 
 read_choice() {
@@ -541,7 +532,7 @@ menu_full_uninstall() {
   print_header
   show_status_bar
   print_section "一键彻底卸载（删除环境）"
-  echo -e " ${YELLOW}说明：官方 uninstall 可能保留 CLI；你要求的是“把环境完整删除”，这里会做 best-effort 清理。${NC}"
+  echo -e " ${YELLOW}说明：官方 uninstall 可能保留 CLI；你要求的是"把环境完整删除"，这里会做 best-effort 清理。${NC}"
   echo -e " ${YELLOW}将删除：$STATE_DIR、~/.openclaw-*、~/.npm-global、systemd user service、临时日志等。${NC}"
   echo ""
 
@@ -1149,7 +1140,7 @@ codex_set_order_manual() {
 
 codex_make_session_pin_command() {
   print_section "生成 /model …@<profileId>（会话级固定账号）"
-  echo -e " ${DIM}说明：这是“会话级”固定账号，不改全局顺序。${NC}"
+  echo -e " ${DIM}说明：这是"会话级"固定账号，不改全局顺序。${NC}"
   echo -e " ${DIM}格式：/model <provider/model>@<profileId>${NC}"
   echo -e " ${DIM}例如：/model openai-codex/gpt-5.2@openai-codex:alt${NC}"
   echo ""
@@ -1177,11 +1168,11 @@ menu_codex_profiles() {
     print_section "Codex 多账号（同一 agent）：选择默认账号 / 设置优先顺序"
     echo -e " 当前 agent: ${GREEN}${agent_id}${NC}"
     echo -e " ${DIM}说明：同一 agent 可保存多个 openai-codex OAuth profile。你可以：${NC}"
-    echo -e " ${DIM}- 设定“默认账号优先顺序”（全局生效）${NC}"
-    echo -e " ${DIM}- 在聊天里用 /model …@profileId 给“当前会话”固定账号${NC}"
+    echo -e " ${DIM}- 设定"默认账号优先顺序"（全局生效）${NC}"
+    echo -e " ${DIM}- 在聊天里用 /model …@profileId 给"当前会话"固定账号${NC}"
     echo ""
     echo -e " ${GREEN}1.${NC} 查看已登录的 Codex 账号列表（profiles）"
-    echo -e " ${GREEN}2.${NC} 查看当前“默认账号优先顺序”（auth order）"
+    echo -e " ${GREEN}2.${NC} 查看当前"默认账号优先顺序"（auth order）"
     echo -e " ${GREEN}3.${NC} 选一个账号作为默认（其他账号自动备用）"
     echo -e " ${GREEN}4.${NC} 手动设置优先顺序（输入多个 profileId）"
     echo -e " ${GREEN}5.${NC} 清空优先顺序（恢复自动选择）"
@@ -1375,7 +1366,7 @@ show_help() {
      - 设置默认优先顺序（auth order）= 默认账号 + 故障切换
      - 生成 /model ...@profileId 用于会话级固定账号
 
-2) “配置了 Codex 账号但提示找不到账号 / Missing auth”
+2) "配置了 Codex 账号但提示找不到账号 / Missing auth"
    - 本脚本采用单一 agent(main) 模式，避免 agent 不一致导致的找不到账号
    - 仍可用【主菜单 5 -> 1】查看 models status
 
