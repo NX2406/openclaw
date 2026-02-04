@@ -63,6 +63,8 @@ OC_MODELS_CHECK_TIMEOUT_SEC="${OC_MODELS_CHECK_TIMEOUT_SEC:-20}"
 OC_MODELS_SET_TIMEOUT_SEC="${OC_MODELS_SET_TIMEOUT_SEC:-20}"
 OC_AUTH_ORDER_TIMEOUT_SEC="${OC_AUTH_ORDER_TIMEOUT_SEC:-15}"
 OC_CONFIG_CMD_TIMEOUT_SEC="${OC_CONFIG_CMD_TIMEOUT_SEC:-15}"
+# openclaw onboard 可能会打开 TUI/提示（远程环境偶发卡住）；这里提供超时保护（可覆盖）
+OC_ONBOARD_TIMEOUT_SEC="${OC_ONBOARD_TIMEOUT_SEC:-600}"
 
 # 兼容：有些系统无 /dev/tty（例如被管道调用）
 TTY="/dev/tty"
@@ -356,10 +358,18 @@ menu_install() {
           press_any_key
           continue
         fi
-        if confirm_action "确认运行：openclaw onboard --install-daemon ？"; then
-          run_cmd openclaw onboard --install-daemon
+        echo -e " ${DIM}提示：为避免远程/无交互环境卡在 TUI 收尾界面，这里默认加 --skip-ui。${NC}"
+        echo -e " ${DIM}如需完整 TUI 体验，请手动运行：openclaw onboard --install-daemon${NC}"
+        if confirm_action "确认运行：openclaw onboard --install-daemon --skip-ui ？"; then
+          run_cmd_timeout "${OC_ONBOARD_TIMEOUT_SEC}" openclaw onboard --install-daemon --skip-ui
           local rc=$?
-          if [[ $rc -eq 0 ]]; then ok "onboard 完成"; else err "onboard 失败（$rc），请查看日志"; fi
+          if is_timeout_rc "$rc"; then
+            warn "onboard 超时（${OC_ONBOARD_TIMEOUT_SEC}s）。可能仍在后台执行或被卡住；建议运行：openclaw doctor / openclaw gateway status"
+          elif [[ $rc -eq 0 ]]; then
+            ok "onboard 完成"
+          else
+            err "onboard 失败（$rc），请查看日志"
+          fi
         else
           warn "已取消"
         fi
