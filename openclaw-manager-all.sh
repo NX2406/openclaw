@@ -375,7 +375,9 @@ menu_install() {
         echo -e " ${DIM}提示：为避免远程/无交互环境卡在 TUI 收尾界面，这里默认加 --skip-ui。${NC}"
         echo -e " ${DIM}如需完整 TUI 体验，请手动运行：openclaw onboard --install-daemon${NC}"
         if confirm_action "确认运行：openclaw onboard --install-daemon --skip-ui ？"; then
-          run_cmd_timeout "${OC_ONBOARD_TIMEOUT_SEC}" openclaw onboard --install-daemon --skip-ui
+          # 关键：部分终端/远程环境里，即使 --skip-ui 也可能落到 TUI 收尾屏。
+          # 加 --json 并断开 stdin，可强制走非交互输出，避免卡在最后一屏。
+          run_cmd_timeout "${OC_ONBOARD_TIMEOUT_SEC}" bash -lc 'openclaw onboard --install-daemon --skip-ui --json </dev/null'
           local rc=$?
           if is_timeout_rc "$rc"; then
             warn "onboard 超时（${OC_ONBOARD_TIMEOUT_SEC}s）。可能仍在后台执行或被卡住；建议运行：openclaw doctor / openclaw gateway status"
