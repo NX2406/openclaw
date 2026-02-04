@@ -119,10 +119,24 @@ ok() { echo -e " ${GREEN}✓${NC} $*"; log "OK: $*"; }
 warn() { echo -e " ${YELLOW}!${NC} $*"; log "WARN: $*"; }
 err() { echo -e " ${RED}✗${NC} $*"; log "ERR: $*"; }
 
+# 交互回到菜单：默认最多等几秒，避免某些远程/无可用 TTY 的环境“看起来卡住”
+PRESS_ANY_KEY_TIMEOUT_SEC="${PRESS_ANY_KEY_TIMEOUT_SEC:-3}"
 press_any_key() {
   echo ""
-  read -r -n 1 -s -p " 按任意键返回菜单..." <"$TTY" || true
-  echo ""
+  # 没有可交互 TTY 时，直接返回（不阻塞）
+  if [[ ! -e "$TTY" ]]; then
+    return 0
+  fi
+  # 0 表示不等待（立刻返回）
+  if [[ "${PRESS_ANY_KEY_TIMEOUT_SEC}" == "0" ]]; then
+    return 0
+  fi
+  # 有些环境 read -t 不支持（极少见），失败则降级为普通 read
+  if read -r -n 1 -s -t "${PRESS_ANY_KEY_TIMEOUT_SEC}" -p " 按任意键返回菜单...（${PRESS_ANY_KEY_TIMEOUT_SEC}s 后自动返回）" <"$TTY"; then
+    echo ""
+  else
+    echo ""
+  fi
 }
 
 read_choice() {
