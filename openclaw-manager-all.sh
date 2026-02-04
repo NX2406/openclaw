@@ -800,14 +800,14 @@ models_auth_login_codex() {
   print_section "Codex OAuth 登录（openai-codex）"
   if ! command_exists openclaw; then err "未安装 openclaw"; return 1; fi
 
-  echo -e " 选择登录方式（均为官方 CLI 路径）："
-  echo -e " ${GREEN}1${NC}) openclaw models auth login --provider openai-codex  ${DIM}(推荐；只做认证)${NC}"
-  echo -e " ${GREEN}2${NC}) openclaw onboard --auth-choice openai-codex           ${DIM}(兜底；向导式，适合远程/TTY 异常)${NC}"
-  echo ""
-  echo -ne " 请选择 [1-2]（回车=1）: "
-  local m
-  IFS= read -r m <"$TTY" || true
-  m="${m:-1}"
+  # 说明：在部分环境里 `openclaw models auth login --provider openai-codex` 会报：
+  # "No provider plugins found"（看起来像 CLI 侧插件发现异常）。
+  # 但 `openclaw onboard --auth-choice openai-codex` 是官方向导路径，远程场景更稳。
+  # 这里直接采用向导路径作为唯一方案，避免用户在失败选项里兜圈。
+
+  echo -e " 将执行：openclaw onboard --auth-choice openai-codex"
+  echo -e " ${DIM}提示：向导会检测 existing config；请选择 'Use existing values' 避免覆盖其它设置。${NC}"
+  echo -e " ${DIM}并使用 --skip-ui --json </dev/null 以避免卡在最后一屏。${NC}"
 
   if ! confirm_action "确认开始登录？"; then
     warn "已取消"
@@ -818,25 +818,16 @@ models_auth_login_codex() {
   agent_dir="$(agent_root_dir "$agent_id")"
   mkdir -p "$agent_dir" >/dev/null 2>&1 || true
 
-  case "$m" in
-    2)
-      echo -e " 将执行：openclaw onboard --auth-choice openai-codex"
-      echo -e " ${DIM}提示：该向导会检测 existing config；请选择 'Use existing values' 避免覆盖其它设置。${NC}"
-      run_cmd env OPENCLAW_AGENT_DIR="$agent_dir" openclaw onboard --auth-choice openai-codex
-      ;;
-    *)
-      echo -e " 将执行：openclaw models auth login --provider openai-codex"
-      echo -e " ${DIM}说明：这是 ChatGPT/Codex 订阅 OAuth（官方推荐命令）。${NC}"
-      echo -e " ${DIM}若为远程/无浏览器环境，登录流程可能要求粘贴回调 URL/代码。${NC}"
-      run_cmd env OPENCLAW_AGENT_DIR="$agent_dir" openclaw models auth login --provider openai-codex
-      ;;
-  esac
-
+  run_cmd_timeout "${OC_ONBOARD_TIMEOUT_SEC}" bash -lc 'openclaw onboard --auth-choice openai-codex --skip-ui --json </dev/null'
   local rc=$?
+  if is_timeout_rc "$rc"; then
+    warn "登录流程超时（${OC_ONBOARD_TIMEOUT_SEC}s）。可能仍在后台执行；建议运行：openclaw doctor / openclaw models status"
+    return 0
+  fi
   if [[ $rc -eq 0 ]]; then
     ok "登录流程完成（建议立即查看 models status 验证）"
   else
-    err "登录失败（$rc）。若你刚选的是 1，可以重试并改选 2（onboard 兜底）。"
+    err "登录失败（$rc）。建议运行：openclaw doctor 并查看 /tmp/openclaw 日志。"
   fi
 }
 
