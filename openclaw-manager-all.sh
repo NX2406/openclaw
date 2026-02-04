@@ -463,19 +463,98 @@ manual_cleanup() {
   return 0
 }
 
+require_phrase() {
+  # require_phrase <phrase> <prompt>
+  local phrase="$1"
+  local prompt="$2"
+  echo -ne " ${YELLOW}${prompt}${NC}"
+  local got
+  IFS= read -r got <"$TTY" || true
+  [[ "$got" == "$phrase" ]]
+}
+
+full_purge_environment() {
+  print_section "彻底删除 OpenClaw 环境（高危操作）"
+  echo -e " ${RED}${BOLD}这会尽可能删除 OpenClaw 相关的所有内容（包括状态目录、profiles、daemon/service、npm 前缀等）。${NC}"
+  echo -e " ${YELLOW}请确认你不需要保留任何历史/凭据/配置。${NC}"
+  echo ""
+
+  # 1) 先尝试停服务/卸载服务（官方）
+  if command_exists openclaw; then
+    warn "尝试停止/卸载 Gateway 服务（best-effort）..."
+    run_cmd openclaw gateway stop || true
+    run_cmd openclaw gateway uninstall || true
+    # 官方卸载（会尽量清理状态；但不同版本可能保留 CLI）
+    run_cmd openclaw uninstall --all --yes || true
+  fi
+
+  # 2) 终止残留进程（best-effort）
+  warn "尝试终止残留进程（best-effort）..."
+  pkill -f openclaw-gateway 2>/dev/null || true
+  pkill -f "openclaw.*gateway" 2>/dev/null || true
+
+  # 3) 删除 systemd user service 文件（Linux）
+  local sd_user_dir="$HOME/.config/systemd/user"
+  if [[ -d "$sd_user_dir" ]]; then
+    warn "清理 systemd user service（OpenClaw Gateway）..."
+    rm -f "$sd_user_dir"/openclaw-gateway*.service 2>/dev/null || true
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user reset-failed 2>/dev/null || true
+  fi
+
+  # 4) 删除 OpenClaw 状态目录（包含 profiles、media、sessions、extensions 等）
+  warn "删除 OpenClaw state dir: $STATE_DIR"
+  rm -rf "$STATE_DIR" 2>/dev/null || true
+
+  # 同时清理同级 profiles（~/.openclaw-dev, ~/.openclaw-xxx）
+  warn "删除 OpenClaw profiles（~/.openclaw-*）..."
+  rm -rf "$HOME"/.openclaw-* 2>/dev/null || true
+
+  # 5) 清理 install.sh 常见 npm prefix（~/.npm-global）
+  warn "清理 npm prefix 目录（~/.npm-global；若被 install.sh 创建）..."
+  rm -rf "$HOME/.npm-global" 2>/dev/null || true
+
+  # 6) 尝试卸载全局 npm 包 openclaw（若存在）
+  if command_exists npm; then
+    warn "尝试 npm uninstall -g openclaw（best-effort）..."
+    run_cmd npm uninstall -g openclaw || true
+  fi
+
+  # 7) 清理常见 user bin 中的 openclaw 可执行（best-effort，仅限 $HOME 下）
+  warn "清理常见用户 bin 的 openclaw 可执行（best-effort）..."
+  rm -f "$HOME/.local/bin/openclaw" 2>/dev/null || true
+  rm -f "$HOME/.npm-global/bin/openclaw" 2>/dev/null || true
+
+  # 8) 清理临时日志
+  rm -rf /tmp/openclaw 2>/dev/null || true
+
+  # 9) 清理 shell PATH 注入（保守：只移除 .npm-global 行）
+  clean_shell_path_injection
+
+  ok "彻底卸载/清理流程执行完毕（best-effort）。"
+  warn "建议你重新打开一个新终端，执行：command -v openclaw（应为空）"
+}
+
 menu_full_uninstall() {
   print_header
   show_status_bar
-  print_section "一键完整卸载"
-  echo -e " 推荐顺序：先跑官方卸载，再做兜底清理。"
+  print_section "一键彻底卸载（删除环境）"
+  echo -e " ${YELLOW}说明：官方 uninstall 可能保留 CLI；你要求的是“把环境完整删除”，这里会做 best-effort 清理。${NC}"
+  echo -e " ${YELLOW}将删除：$STATE_DIR、~/.openclaw-*、~/.npm-global、systemd user service、临时日志等。${NC}"
   echo ""
-  if confirm_action "继续执行一键卸载流程？"; then
-    run_official_uninstall || true
-    echo ""
-    manual_cleanup || true
+
+  if ! confirm_action "确定继续？"; then
+    warn "已取消"
+    press_any_key
+    return 0
+  fi
+
+  echo ""
+  if require_phrase "DELETE" "为防误操作，请输入 ${BOLD}DELETE${NC}${YELLOW} 并回车确认： "; then
+    full_purge_environment
     invalidate_openclaw_version_cache
   else
-    warn "已取消"
+    warn "确认短语不匹配，已取消"
   fi
   press_any_key
 }
