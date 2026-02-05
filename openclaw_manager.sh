@@ -677,14 +677,11 @@ telegram_bot_link() {
 # 功能4: 多账号管理
 #===============================================================================
 
-# OpenClaw 状态目录 (支持 OPENCLAW_STATE_DIR 覆盖)
-OC_STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
-
-# OpenClaw 配置/脚本配置路径
-OPENCLAW_CONFIG="$OC_STATE_DIR/openclaw.json"
-ACCOUNTS_CONFIG="$OC_STATE_DIR/accounts.json"
-BACKUP_DIR="$OC_STATE_DIR/backups"
-LOCK_FILE="$OC_STATE_DIR/.accounts.lock"
+# OpenClaw配置文件路径
+OPENCLAW_CONFIG="$HOME/.openclaw/openclaw.json"
+ACCOUNTS_CONFIG="$HOME/.openclaw/accounts.json"
+BACKUP_DIR="$HOME/.openclaw/backups"
+LOCK_FILE="$HOME/.openclaw/.accounts.lock"
 
 #===============================================================================
 # API 保护机制 - 备份、验证、回滚
@@ -798,19 +795,34 @@ rollback_config() {
 safe_switch_account() {
     local new_index=$1
     local old_index=$(jq '.activeAccountIndex // 0' "$ACCOUNTS_CONFIG" 2>/dev/null)
-    
+
     # 1. 获取锁
     if ! acquire_lock; then
         return 1
     fi
-    
-    # 2. 创建备份
+
+    # 2. 创建备份（accounts.json）
     local backup_file=$(create_backup "switch")
     if [ -n "$backup_file" ]; then
         info_msg "已创建备份: $(basename "$backup_file")"
     fi
-    
-    # 3. 更新配置
+
+    # 3. 先应用所选账号到 OpenClaw（只有当账号带 profileFile 才能真正“切换”）
+    local new_profile_file
+    new_profile_file=$(jq -r ".accounts[$new_index].profileFile // empty" "$ACCOUNTS_CONFIG" 2>/dev/null)
+
+    if [ -n "$new_profile_file" ] && [ "$new_profile_file" != "null" ]; then
+        info_msg "正在应用所选账号到 OpenClaw..."
+        if ! apply_profile_to_openclaw "$new_profile_file"; then
+            warn_msg "应用账号配置失败，已取消切换"
+            release_lock
+            return 1
+        fi
+    else
+        warn_msg "该账号没有 profileFile（可能是扫描到的系统账号），将仅切换脚本内部索引"
+    fi
+
+    # 4. 更新 accounts.json（activeAccountIndex）
     local temp_file=$(mktemp)
     if ! jq ".activeAccountIndex = $new_index | .lastSwitchTime = \"$(date -Iseconds)\"" "$ACCOUNTS_CONFIG" > "$temp_file"; then
         rm -f "$temp_file"
@@ -818,34 +830,40 @@ safe_switch_account() {
         error_msg "更新配置失败"
         return 1
     fi
-    
-    # 4. 验证 JSON 格式
+
+    # 5. 验证 JSON 格式
     if ! jq empty "$temp_file" 2>/dev/null; then
         rm -f "$temp_file"
         release_lock
         error_msg "配置格式验证失败"
         return 1
     fi
-    
-    # 5. 原子写入
+
+    # 6. 原子写入
     mv "$temp_file" "$ACCOUNTS_CONFIG"
-    
-    # 6. 验证新账号
+
+    # 7. 验证新账号（可选）
     if ! validate_account "$new_index"; then
         warn_msg "新账号验证失败，正在回滚..."
         if [ -n "$backup_file" ] && [ -f "$backup_file" ]; then
             cp "$backup_file" "$ACCOUNTS_CONFIG"
+            # 尝试恢复旧账号的 OpenClaw 凭证（如果旧账号也有 profileFile）
+            local old_profile_file
+            old_profile_file=$(jq -r ".accounts[$old_index].profileFile // empty" "$backup_file" 2>/dev/null)
+            if [ -n "$old_profile_file" ] && [ "$old_profile_file" != "null" ]; then
+                apply_profile_to_openclaw "$old_profile_file" >/dev/null 2>&1 || true
+            fi
             error_msg "已回滚到之前的配置"
         fi
         release_lock
         return 1
     fi
-    
-    # 7. 释放锁
+
+    # 8. 释放锁
     release_lock
-    
     return 0
 }
+
 
 # 显示备份列表
 show_backups() {
@@ -963,7 +981,7 @@ sync_openclaw_accounts() {
         return
     fi
     
-    local openclaw_dir="$OC_STATE_DIR"
+    local openclaw_dir="$HOME/.openclaw"
     local synced=false
     local temp_file=$(mktemp)
     
@@ -1084,7 +1102,7 @@ force_sync_accounts() {
     info_msg "正在扫描 OpenClaw 配置..."
     echo ""
     echo -e "   ${GRAY}• 检查 credentials/oauth.json${NC}"
-    echo -e "   ${GRAY}• 检查 agents/*/agent/auth-profiles.json${NC}"
+    echo -e "   ${GRAY}• 检查 agents/*/auth-profiles.json${NC}"
     echo -e "   ${GRAY}• 检查 openclaw.json${NC}"
     echo ""
     
@@ -1124,8 +1142,8 @@ EOF
         warn_msg "未发现已配置的账号"
         echo ""
         echo -e "${GRAY}请确保已通过以下方式配置账号:${NC}"
-        echo -e "   ${CYAN}openclaw models auth setup-token --provider anthropic${NC}"
-        echo -e "   ${CYAN}openclaw models auth login --provider openai-codex${NC}"
+        echo -e "   ${CYAN}openclaw auth login anthropic --oauth${NC}"
+        echo -e "   ${CYAN}openclaw auth login openai --oauth${NC}"
     fi
     
     echo ""
@@ -1218,9 +1236,288 @@ show_all_accounts() {
 }
 
 # 添加OAuth账号 (支持无头服务器 - 直接运行命令)
+# ------------------------------------------------------------------------------
+# OAuth 多账号：调用官方登录流程，但“保存为并行配置”，避免覆盖现有凭证
+# ------------------------------------------------------------------------------
+
+# 用于保存多个 OAuth 配置快照（并行存在）
+PROFILES_DIR="$HOME/.openclaw/account-profiles"
+
+# 获取 OpenClaw 的 state 目录（优先使用环境变量 OPENCLAW_STATE_DIR）
+get_openclaw_state_dir() {
+    if [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
+        echo "$OPENCLAW_STATE_DIR"
+    else
+        echo "$HOME/.openclaw"
+    fi
+}
+
+# 列出所有 auth-profiles.json
+list_auth_profiles_files() {
+    local state_dir="$1"
+    find "$state_dir/agents" -maxdepth 3 -type f -path "*/agent/auth-profiles.json" 2>/dev/null
+}
+
+# 选择一个“主”auth-profiles.json（优先 main）
+get_primary_auth_profiles_file() {
+    local state_dir="$1"
+    local main_file="$state_dir/agents/main/agent/auth-profiles.json"
+
+    # main 目录存在/文件存在都认为是主位置
+    if [ -f "$main_file" ] || [ -d "$state_dir/agents/main/agent" ]; then
+        echo "$main_file"
+        return 0
+    fi
+
+    local first_file
+    first_file="$(list_auth_profiles_files "$state_dir" | head -n 1)"
+    if [ -n "$first_file" ]; then
+        echo "$first_file"
+        return 0
+    fi
+
+    # 都没有则返回默认 main 路径（后续会 mkdir -p）
+    echo "$main_file"
+    return 0
+}
+
+# 检查并安装 provider 插件（OpenClaw 2026.x 需要 provider plugins）
+ensure_provider_plugins() {
+    info_msg "检查 provider 插件..."
+    local out rc
+    out="$(openclaw plugins list 2>&1)"
+    rc=$?
+
+    # 有些版本在没有插件时会返回非 0 且提示 "No provider plugins found"
+    if echo "$out" | grep -qiE "No provider plugins found|no provider plugins found"; then
+        warn_msg "未检测到 provider 插件，将执行官方安装：openclaw plugins install"
+        echo ""
+        openclaw plugins install </dev/tty
+        echo ""
+        return 0
+    fi
+
+    # plugins list 本身失败，也尝试安装一次（避免误判）
+    if [ $rc -ne 0 ]; then
+        warn_msg "插件列表检查失败，将尝试执行：openclaw plugins install"
+        echo ""
+        openclaw plugins install </dev/tty
+        echo ""
+        return 0
+    fi
+
+    success_msg "provider 插件已就绪"
+    return 0
+}
+
+# 对 OpenClaw 可能被覆盖的“凭证文件”做快照（只快照这些文件，不动插件目录）
+snapshot_openclaw_auth_materials() {
+    local state_dir="$1"
+    local snap_dir
+    snap_dir="$(mktemp -d)"
+
+    mkdir -p "$snap_dir/files"
+    : > "$snap_dir/filelist.txt"
+
+    # 关注的文件：
+    # 1) agents/*/agent/auth-profiles.json
+    # 2) credentials/oauth.json（兼容旧/混合写入）
+    find "$state_dir" -maxdepth 4 -type f \( \
+        -path "*/agent/auth-profiles.json" -o \
+        -path "*/credentials/oauth.json" \
+    \) -print0 2>/dev/null | while IFS= read -r -d '' f; do
+        local rel="${f#$state_dir/}"
+        local dst="$snap_dir/files/$rel"
+        mkdir -p "$(dirname "$dst")"
+        cp "$f" "$dst"
+        echo "$rel" >> "$snap_dir/filelist.txt"
+    done
+
+    echo "$snap_dir"
+}
+
+# 恢复快照，并删除快照之后新产生的“凭证文件”（避免污染原配置）
+restore_openclaw_auth_materials() {
+    local state_dir="$1"
+    local snap_dir="$2"
+
+    # 1) 还原快照里记录的文件
+    if [ -f "$snap_dir/filelist.txt" ]; then
+        while IFS= read -r rel; do
+            [ -z "$rel" ] && continue
+            local src="$snap_dir/files/$rel"
+            local dst="$state_dir/$rel"
+            if [ -f "$src" ]; then
+                mkdir -p "$(dirname "$dst")"
+                cp "$src" "$dst"
+            fi
+        done < "$snap_dir/filelist.txt"
+    fi
+
+    # 2) 删除“新增”的凭证文件（只删我们关心的两类文件）
+    local current_list snap_list
+    current_list="$(mktemp)"
+    snap_list="$(mktemp)"
+
+    find "$state_dir" -maxdepth 4 -type f \( \
+        -path "*/agent/auth-profiles.json" -o \
+        -path "*/credentials/oauth.json" \
+    \) 2>/dev/null | sed "s|^$state_dir/||" | sort > "$current_list"
+
+    if [ -f "$snap_dir/filelist.txt" ]; then
+        sort "$snap_dir/filelist.txt" > "$snap_list"
+    else
+        : > "$snap_list"
+    fi
+
+    comm -13 "$snap_list" "$current_list" | while IFS= read -r rel; do
+        [ -z "$rel" ] && continue
+        rm -f "$state_dir/$rel"
+    done
+
+    rm -f "$current_list" "$snap_list"
+}
+
+# 运行“官方添加账号/登录”命令（尽量保持官方交互）
+run_official_openclaw_login() {
+    local provider="$1"
+
+    # 优先用官方推荐：openclaw models auth login --provider <provider>
+    # 兼容某些版本存在 --method 参数（通过 --help 探测）
+    if openclaw models auth login --help >/dev/null 2>&1; then
+        if openclaw models auth login --help 2>&1 | grep -q -- "--method"; then
+            openclaw models auth login --provider "$provider" --method oauth </dev/tty
+        else
+            openclaw models auth login --provider "$provider" </dev/tty
+        fi
+        return $?
+    fi
+
+    # 兜底：有的版本可能是 openclaw auth login
+    if openclaw auth login --help >/dev/null 2>&1; then
+        if openclaw auth login --help 2>&1 | grep -q -- "--method"; then
+            openclaw auth login --provider "$provider" --method oauth </dev/tty
+        else
+            openclaw auth login --provider "$provider" </dev/tty
+        fi
+        return $?
+    fi
+
+    # 最后兜底：直接尝试
+    openclaw models auth login --provider "$provider" </dev/tty
+    return $?
+}
+
+# 将“并行保存”的账号配置应用到 OpenClaw（用户选择后才覆盖 active 配置）
+apply_profile_to_openclaw() {
+    local profile_file="$1"
+
+    if [ ! -f "$profile_file" ]; then
+        error_msg "找不到配置文件: $profile_file"
+        return 1
+    fi
+
+    if ! command -v jq &> /dev/null; then
+        error_msg "未安装 jq，无法应用配置"
+        return 1
+    fi
+
+    local state_dir provider
+    state_dir="$(get_openclaw_state_dir)"
+    provider="$(jq -r '.provider // empty' "$profile_file" 2>/dev/null)"
+
+    if [ -z "$provider" ] || [ "$provider" = "null" ]; then
+        error_msg "配置文件缺少 provider 字段"
+        return 1
+    fi
+
+    # 1) 应用 auth-profiles entry（如果存在）
+    local has_auth_entry
+    has_auth_entry="$(jq -r '.storage.authProfiles.entry != null' "$profile_file" 2>/dev/null || echo "false")"
+
+    if [ "$has_auth_entry" = "true" ]; then
+        local target_auth
+        target_auth="$(get_primary_auth_profiles_file "$state_dir")"
+        mkdir -p "$(dirname "$target_auth")"
+
+        # 备份
+        local bak_auth=""
+        if [ -f "$target_auth" ]; then
+            bak_auth="${target_auth}.bak.$(date +%Y%m%d_%H%M%S)"
+            cp "$target_auth" "$bak_auth"
+        fi
+
+        # 确保目标是 JSON
+        if [ ! -f "$target_auth" ]; then
+            echo '{}' > "$target_auth"
+        fi
+
+        local entry_file tmp_out
+        entry_file="$(mktemp)"
+        jq '.storage.authProfiles.entry' "$profile_file" > "$entry_file" 2>/dev/null || echo "null" > "$entry_file"
+
+        tmp_out="$(mktemp)"
+        if jq --arg p "$provider" --slurpfile e "$entry_file" '.[$p] = $e[0]' "$target_auth" > "$tmp_out" 2>/dev/null; then
+            mv "$tmp_out" "$target_auth"
+            success_msg "已应用到: $target_auth"
+        else
+            rm -f "$tmp_out"
+            # 回滚
+            if [ -n "$bak_auth" ] && [ -f "$bak_auth" ]; then
+                cp "$bak_auth" "$target_auth"
+            fi
+            rm -f "$entry_file"
+            error_msg "应用 auth-profiles 失败"
+            return 1
+        fi
+        rm -f "$entry_file"
+    fi
+
+    # 2) 应用 credentials/oauth.json entry（如果存在）
+    local has_oauth_entry
+    has_oauth_entry="$(jq -r '.storage.oauthJson.entry != null' "$profile_file" 2>/dev/null || echo "false")"
+
+    if [ "$has_oauth_entry" = "true" ]; then
+        local oauth_file="$state_dir/credentials/oauth.json"
+        mkdir -p "$(dirname "$oauth_file")"
+
+        local bak_oauth=""
+        if [ -f "$oauth_file" ]; then
+            bak_oauth="${oauth_file}.bak.$(date +%Y%m%d_%H%M%S)"
+            cp "$oauth_file" "$bak_oauth"
+        fi
+
+        if [ ! -f "$oauth_file" ]; then
+            echo '{}' > "$oauth_file"
+        fi
+
+        local oauth_entry_file tmp_out2
+        oauth_entry_file="$(mktemp)"
+        jq '.storage.oauthJson.entry' "$profile_file" > "$oauth_entry_file" 2>/dev/null || echo "null" > "$oauth_entry_file"
+
+        tmp_out2="$(mktemp)"
+        if jq --arg p "$provider" --slurpfile e "$oauth_entry_file" '.[$p] = $e[0]' "$oauth_file" > "$tmp_out2" 2>/dev/null; then
+            mv "$tmp_out2" "$oauth_file"
+            success_msg "已应用到: $oauth_file"
+        else
+            rm -f "$tmp_out2"
+            if [ -n "$bak_oauth" ] && [ -f "$bak_oauth" ]; then
+                cp "$bak_oauth" "$oauth_file"
+            fi
+            rm -f "$oauth_entry_file"
+            error_msg "应用 oauth.json 失败"
+            return 1
+        fi
+        rm -f "$oauth_entry_file"
+    fi
+
+    return 0
+}
+
+# 添加OAuth账号（调用官方登录；保存为并行配置；用户选择后才覆盖 active 配置）
 add_oauth_account() {
     show_banner
-    echo -e "${BLUE}${BOLD}【 添加订阅账号 (OAuth / Setup-Token) 】${NC}"
+    echo -e "${BLUE}${BOLD}【 添加 OAuth 账号（并行保存，不覆盖）】${NC}"
     print_line
     echo ""
 
@@ -1233,7 +1530,6 @@ add_oauth_account() {
         return
     fi
 
-    # 检查 openclaw 是否安装
     if ! command -v openclaw &> /dev/null; then
         error_msg "未检测到 OpenClaw 安装!"
         echo -e "${YELLOW}请先安装 OpenClaw 再添加账号${NC}"
@@ -1241,198 +1537,219 @@ add_oauth_account() {
         return
     fi
 
-    # OpenClaw 状态目录（支持 OPENCLAW_STATE_DIR 覆盖）
-    local state_dir="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
-
-    echo -e "${WHITE}支持的订阅认证方式:${NC}"
-    echo -e "   • ${GREEN}ChatGPT / Codex 订阅${NC}: 使用 OAuth (provider: openai-codex)"
-    echo -e "   • ${PURPLE}Claude Pro/Max 订阅${NC}: 使用 Claude Code 的 setup-token (provider: anthropic)"
-    echo ""
-    echo -e "${YELLOW}提示:${NC}"
-    echo -e "   • 远程/无头服务器登录 OpenAI OAuth 时，OpenClaw 会让你复制授权 URL 并在本地浏览器完成，然后粘贴回调 URL/Code。"
-    echo -e "   • Claude 订阅请先在任意机器运行: ${CYAN}claude setup-token${NC}，得到 token 后在本机粘贴。"
-    echo ""
-    print_line
-    echo ""
-
-    # 输入账号名称
+    # 账号名称
     echo -e "${CYAN}请输入账号名称 (如: 个人账号, 工作账号): ${NC}"
     read -r account_name </dev/tty
-
     if [ -z "$account_name" ]; then
         warn_msg "账号名称不能为空"
         press_any_key
         return
     fi
 
-    # 检查账号名称是否已存在
-    if jq -e ".accounts[] | select(.name == \"$account_name\")" "$ACCOUNTS_CONFIG" >/dev/null 2>&1; then
+    # 防重名
+    if [ -f "$ACCOUNTS_CONFIG" ] && jq -e ".accounts[] | select(.name == \"$account_name\")" "$ACCOUNTS_CONFIG" >/dev/null 2>&1; then
         warn_msg "账号名称 \"$account_name\" 已存在"
         echo -e "${GRAY}请使用不同的名称${NC}"
         press_any_key
         return
     fi
 
-    # 选择账号类型
     echo ""
-    echo -e "${CYAN}请选择账号类型:${NC}"
-    echo -e "   ${PURPLE}1.${NC} Claude Pro/Max (Anthropic setup-token)"
-    echo -e "   ${GREEN}2.${NC} ChatGPT Plus/Pro (OpenAI Codex OAuth)"
+    echo -e "${CYAN}请选择要添加的 Provider:${NC}"
+    echo -e "   ${GREEN}1.${NC} ChatGPT Plus/Pro (openai-codex)"
+    echo -e "   ${BLUE}2.${NC} Claude Pro/Max (anthropic)"
+    echo -e "   ${PURPLE}3.${NC} Gemini Pro (google-antigravity)"
     echo ""
-    echo -e "${CYAN}请输入选项 [1-2]: ${NC}"
+    echo -e "${CYAN}请输入选项 [1-3]: ${NC}"
     read -r type_choice </dev/tty
 
-    local oauth_provider auth_method
+    local oauth_provider account_type
     case $type_choice in
-        1) oauth_provider="anthropic"; auth_method="setup_token" ;;
-        2) oauth_provider="openai-codex"; auth_method="oauth" ;;
+        1) oauth_provider="openai-codex"; account_type="chatgpt" ;;
+        2) oauth_provider="anthropic"; account_type="claude" ;;
+        3) oauth_provider="google-antigravity"; account_type="gemini" ;;
         *) warn_msg "无效的选项"; press_any_key; return ;;
     esac
 
     echo ""
     print_line
-    echo ""
-    echo -e "${CYAN}${BOLD}【 认证流程 】${NC}"
+    echo -e "${WHITE}将调用 OpenClaw 官方添加账号流程：${NC}"
+    echo -e "   ${CYAN}openclaw models auth login --provider ${oauth_provider}${NC}"
+    echo -e "${GRAY}（脚本会在登录结束后，把新凭证保存为“并行配置”，并恢复原配置不被覆盖）${NC}"
+    print_line
     echo ""
 
-    case "$auth_method" in
-        "oauth")
-            info_msg "将运行 OpenAI Codex OAuth 登录:"
-            echo -e "   ${CYAN}openclaw models auth login --provider ${oauth_provider}${NC}"
-            echo ""
-            echo -e "${WHITE}${BOLD}操作步骤:${NC}"
-            echo -e "   ${GREEN}1.${NC} 命令会显示授权 URL"
-            echo -e "   ${GREEN}2.${NC} 复制 URL 到本地浏览器完成登录"
-            echo -e "   ${GREEN}3.${NC} 按提示粘贴回调 URL/Code 完成认证"
-            echo ""
-            echo -e "${CYAN}按任意键开始...${NC}"
-            read -n 1 -s -r </dev/tty
-            echo ""
-            openclaw models auth login --provider "$oauth_provider" </dev/tty
-            ;;
-        "setup_token")
-            info_msg "将运行 Claude setup-token 粘贴流程:"
-            echo -e "   ${CYAN}openclaw models auth setup-token --provider ${oauth_provider}${NC}"
-            echo ""
-            echo -e "${WHITE}${BOLD}操作步骤:${NC}"
-            echo -e "   ${GREEN}1.${NC} 在任意机器运行 ${CYAN}claude setup-token${NC} 获取 token"
-            echo -e "   ${GREEN}2.${NC} 按 OpenClaw 提示把 token 粘贴进来"
-            echo ""
-            echo -e "${CYAN}按任意键开始...${NC}"
-            read -n 1 -s -r </dev/tty
-            echo ""
-            openclaw models auth setup-token --provider "$oauth_provider" </dev/tty
-            ;;
-    esac
+    # 1) 确保 provider 插件存在（避免 No provider plugins found）
+    ensure_provider_plugins
 
-    local auth_result=$?
+    # 2) 快照现有凭证文件（防止覆盖）
+    local state_dir
+    state_dir="$(get_openclaw_state_dir)"
+    local snap_dir
+    snap_dir="$(snapshot_openclaw_auth_materials "$state_dir")"
+
+    # 3) 运行官方登录（带一次自动重试：若仍提示无插件，则安装后重试）
+    echo -e "${CYAN}按任意键开始官方登录...${NC}"
+    read -n 1 -s -r </dev/tty
+    echo ""
+
+    local log_file auth_rc
+    log_file="$(mktemp)"
+    run_official_openclaw_login "$oauth_provider" 2>&1 | tee "$log_file"
+    auth_rc=${PIPESTATUS[0]}
+
+    # 若仍报 “No provider plugins found”，自动安装后再重试一次
+    if [ $auth_rc -ne 0 ] && grep -qi "No provider plugins found" "$log_file"; then
+        echo ""
+        warn_msg "检测到 provider 插件缺失，正在安装后重试一次..."
+        echo ""
+        openclaw plugins install </dev/tty
+        echo ""
+
+        run_official_openclaw_login "$oauth_provider" 2>&1 | tee "$log_file"
+        auth_rc=${PIPESTATUS[0]}
+    fi
 
     echo ""
     print_line
     echo ""
 
-    if [ $auth_result -eq 0 ]; then
-        success_msg "认证命令已完成"
-    else
-        warn_msg "认证命令返回状态码: $auth_result"
-        echo ""
-        echo -e "${YELLOW}如果看到类似 'No provider plugins found' / 'plugin disabled' 的提示:${NC}"
-        echo -e "   • 先查看插件: ${CYAN}openclaw plugins list${NC}"
-        echo -e "   • 启用需要的插件: ${CYAN}openclaw plugins enable <plugin-id>${NC}"
-        echo ""
-        echo -e "${GRAY}你也可以手动重试（按官方命令）:${NC}"
-        if [ "$auth_method" = "oauth" ]; then
-            echo -e "   ${CYAN}openclaw models auth login --provider ${oauth_provider}${NC}"
+    # 4) 从 OpenClaw 写入后的文件里抓取“新凭证”
+    local auth_entry_file oauth_entry_file
+    auth_entry_file="$(mktemp)"
+    oauth_entry_file="$(mktemp)"
+    echo "null" > "$auth_entry_file"
+    echo "null" > "$oauth_entry_file"
+
+    local found_auth="false"
+    local found_oauth="false"
+    local found_agent=""
+
+    # 4.1) auth-profiles.json 中抓 entry
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        if jq -e --arg p "$oauth_provider" '.[$p] != null' "$f" >/dev/null 2>&1; then
+            jq --arg p "$oauth_provider" '.[$p]' "$f" > "$auth_entry_file" 2>/dev/null || echo "null" > "$auth_entry_file"
+            found_auth="true"
+            found_agent="$(echo "$f" | sed -n 's|.*/agents/\([^/]*\)/agent/auth-profiles.json|\1|p')"
+            break
+        fi
+    done < <(list_auth_profiles_files "$state_dir")
+
+    # 4.2) credentials/oauth.json 中抓 entry（兼容旧/混合写入）
+    local oauth_file="$state_dir/credentials/oauth.json"
+    if [ -f "$oauth_file" ] && jq -e --arg p "$oauth_provider" '.[$p] != null' "$oauth_file" >/dev/null 2>&1; then
+        jq --arg p "$oauth_provider" '.[$p]' "$oauth_file" > "$oauth_entry_file" 2>/dev/null || echo "null" > "$oauth_entry_file"
+        found_oauth="true"
+    fi
+
+    # 5) 无论成功失败，都先恢复快照（确保“不覆盖原配置”）
+    restore_openclaw_auth_materials "$state_dir" "$snap_dir"
+    rm -rf "$snap_dir"
+    rm -f "$log_file"
+
+    # 6) 如果没抓到凭证，就不保存（避免生成无效并行配置）
+    if [ "$found_auth" != "true" ] && [ "$found_oauth" != "true" ]; then
+        if [ $auth_rc -ne 0 ]; then
+            error_msg "官方登录未成功 (返回码: $auth_rc)，且未捕获到新的凭证"
         else
-            echo -e "   ${CYAN}openclaw models auth setup-token --provider ${oauth_provider}${NC}"
-            echo -e "   ${CYAN}openclaw models auth paste-token --provider ${oauth_provider}${NC}"
+            error_msg "登录流程结束，但未在配置文件中捕获到新凭证（可能登录未完成）"
         fi
-    fi
-
-    echo ""
-    info_msg "正在验证账号配置 (扫描 auth-profiles.json)..."
-
-    # 验证账号是否真正可用：在任意 agent 的 auth-profiles.json 中找到对应 provider
-    local account_status="unknown"
-    local verification_passed=false
-    local found_profile_file=""
-
-    for profile_file in "$state_dir"/agents/*/agent/auth-profiles.json; do
-        if [ -f "$profile_file" ]; then
-            if jq -e --arg p "$oauth_provider" '.[$p] != null' "$profile_file" >/dev/null 2>&1; then
-                verification_passed=true
-                found_profile_file="$profile_file"
-                break
-            fi
-        fi
-    done
-
-    if [ "$verification_passed" = true ]; then
-        account_status="active"
-        echo -e "   ${GREEN}✓${NC} 已在 $(echo "$found_profile_file" | sed "s|$HOME|~|") 中发现 ${oauth_provider} 凭证"
-    else
-        warn_msg "未能在 auth-profiles.json 中验证到凭证"
-        echo -e "${GRAY}提示: auth-profiles.json 通常位于: $state_dir/agents/<agentId>/agent/auth-profiles.json${NC}"
         echo ""
-        echo -e "${CYAN}是否仍要添加此账号? (状态将标记为 'pending') [y/N]: ${NC}"
-        read -r force_add </dev/tty
-
-        if [[ ! "$force_add" =~ ^[Yy]$ ]]; then
-            info_msg "已取消添加账号"
-            press_any_key
-            return
-        fi
-        account_status="pending"
+        echo -e "${YELLOW}你可以手动执行官方命令确认：${NC}"
+        echo -e "   ${CYAN}openclaw models auth login --provider ${oauth_provider}${NC}"
+        echo ""
+        press_any_key
+        rm -f "$auth_entry_file" "$oauth_entry_file"
+        return
     fi
 
-    # 创建备份 (只备份，不覆盖)
-    create_backup "add_account" >/dev/null 2>&1 || true
+    # 7) 保存为“并行配置文件”
+    mkdir -p "$PROFILES_DIR/$oauth_provider"
 
-    # 添加账号到配置 (追加，不覆盖现有账号)
-    local new_account=$(jq -n \
+    # 生成一个安全的 profile id（避免中文/空格导致路径问题）
+    local ts safe_name profile_id profile_file
+    ts="$(date +%Y%m%d_%H%M%S)"
+    safe_name="$(echo "$account_name" | tr -cs '[:alnum:]' '_' | tr '[:upper:]' '[:lower:]' | sed 's/^_//;s/_$//')"
+    [ -z "$safe_name" ] && safe_name="account"
+    profile_id="${ts}_${safe_name}"
+    profile_file="$PROFILES_DIR/$oauth_provider/${profile_id}.json"
+
+    # 生成 wrapper JSON
+    if ! jq -n \
+        --arg id "$profile_id" \
         --arg name "$account_name" \
-        --arg type "$auth_method" \
         --arg provider "$oauth_provider" \
-        --arg status "$account_status" \
-        --arg addedAt "$(date -Iseconds)" \
-        --argjson verified "$verification_passed" \
-        '{name: $name, type: $type, provider: $provider, status: $status, addedAt: $addedAt, lastUsed: null, verified: $verified}')
+        --arg createdAt "$(date -Iseconds)" \
+        --arg agentId "$found_agent" \
+        --slurpfile auth "$auth_entry_file" \
+        --slurpfile oauth "$oauth_entry_file" \
+        '{
+            id: $id,
+            name: $name,
+            provider: $provider,
+            createdAt: $createdAt,
+            storage: {
+                authProfiles: (if ($auth[0] != null) then {agentId: ($agentId|select(. != "")), entry: $auth[0]} else null end),
+                oauthJson: (if ($oauth[0] != null) then {entry: $oauth[0]} else null end)
+            }
+        }' > "$profile_file" 2>/dev/null; then
+        error_msg "保存并行配置失败: $profile_file"
+        rm -f "$auth_entry_file" "$oauth_entry_file"
+        press_any_key
+        return
+    fi
 
-    # 使用 jq 追加账号 (不会覆盖现有账号)
-    local temp_file=$(mktemp)
-    if jq ".accounts += [$new_account]" "$ACCOUNTS_CONFIG" > "$temp_file"; then
+    rm -f "$auth_entry_file" "$oauth_entry_file"
+
+    # 8) 写入脚本自己的账号索引（不会覆盖现有账号）
+    create_backup "add_account"
+
+    local new_account
+    new_account=$(jq -n \
+        --arg name "$account_name" \
+        --arg type "$account_type" \
+        --arg provider "$oauth_provider" \
+        --arg status "saved" \
+        --arg profileFile "$profile_file" \
+        --arg addedAt "$(date -Iseconds)" \
+        '{name: $name, type: $type, provider: $provider, status: $status, profileFile: $profileFile, addedAt: $addedAt, lastUsed: null, verified: true}')
+
+    local temp_file
+    temp_file="$(mktemp)"
+    if jq ".accounts += [$new_account]" "$ACCOUNTS_CONFIG" > "$temp_file" 2>/dev/null; then
         mv "$temp_file" "$ACCOUNTS_CONFIG"
     else
         rm -f "$temp_file"
-        error_msg "添加账号失败"
+        error_msg "写入 accounts.json 失败"
         press_any_key
         return
     fi
 
     echo ""
-    if [ "$verification_passed" = true ]; then
-        success_msg "账号 \"$account_name\" 添加成功! (已验证)"
-    else
-        warn_msg "账号 \"$account_name\" 已添加 (待验证)"
-        echo -e "${GRAY}请稍后使用 '测试账号可用性' 功能验证${NC}"
-    fi
+    success_msg "账号 \"$account_name\" 已保存为并行配置（未覆盖原 OpenClaw 配置）"
+    echo -e "${GRAY}保存位置: $profile_file${NC}"
     echo ""
 
-    # 询问是否设置为活跃账号
-    local account_count=$(jq '.accounts | length' "$ACCOUNTS_CONFIG" 2>/dev/null || echo "0")
-    if [ "$account_count" -gt 1 ] && [ "$verification_passed" = true ]; then
-        echo -e "${CYAN}是否将此账号设为当前活跃账号? [Y/n]: ${NC}"
-        read -r set_active </dev/tty
-        if [[ ! "$set_active" =~ ^[Nn]$ ]]; then
-            local temp_file2=$(mktemp)
-            jq ".activeAccountIndex = $((account_count - 1))" "$ACCOUNTS_CONFIG" > "$temp_file2" && mv "$temp_file2" "$ACCOUNTS_CONFIG"
-            success_msg "已将 \"$account_name\" 设为活跃账号"
+    # 9) 让用户选择是否立即启用（启用才会覆盖 active 配置）
+    echo -e "${CYAN}是否立即启用该账号为当前 ${oauth_provider} 的活动凭证? [Y/n]: ${NC}"
+    read -r set_active </dev/tty
+    if [[ ! "$set_active" =~ ^[Nn]$ ]]; then
+        if apply_profile_to_openclaw "$profile_file"; then
+            # 更新 activeAccountIndex 为最后一个
+            local account_count
+            account_count=$(jq '.accounts | length' "$ACCOUNTS_CONFIG" 2>/dev/null || echo "1")
+            local temp_file2
+            temp_file2="$(mktemp)"
+            jq ".activeAccountIndex = $((account_count - 1)) | .lastSwitchTime = \"$(date -Iseconds)\"" "$ACCOUNTS_CONFIG" > "$temp_file2" && mv "$temp_file2" "$ACCOUNTS_CONFIG"
+            success_msg "已启用 \"$account_name\""
+        else
+            warn_msg "启用失败，但并行配置已保存；你可以稍后在“手动切换账号”中启用"
         fi
     fi
 
     press_any_key
 }
-
 
 # 删除账号
 remove_account() {
@@ -1736,7 +2053,7 @@ test_accounts() {
     echo ""
     
     # 检查 auth-profiles.json 中的账号
-    local auth_profile="$OC_STATE_DIR/agents/main/agent/auth-profiles.json"
+    local auth_profile="$HOME/.openclaw/agents/main/agent/auth-profiles.json"
     
     info_msg "检查账号凭证配置..."
     echo ""
@@ -1747,7 +2064,7 @@ test_accounts() {
         
         local providers=$(jq -r 'keys[]' "$auth_profile" 2>/dev/null)
         for provider in $providers; do
-            local has_oauth=$(jq -r --arg p "$provider" '.[$p].oauth // empty' "$auth_profile" 2>/dev/null)
+            local has_oauth=$(jq -r ".$provider.oauth // empty" "$auth_profile" 2>/dev/null)
             if [ -n "$has_oauth" ] && [ "$has_oauth" != "null" ]; then
                 echo -e "   ${GREEN}✓${NC} $provider - OAuth 已配置"
             else
@@ -1776,7 +2093,7 @@ test_accounts() {
         if grep -qi "$provider.*ok\|$provider.*success\|$provider.*active" "$probe_output" 2>/dev/null; then
             verified=true
             new_status="active"
-        elif [ -f "$auth_profile" ] && jq -e --arg p "$provider" '.[$p] != null' "$auth_profile" >/dev/null 2>&1; then
+        elif [ -f "$auth_profile" ] && jq -e ".$provider" "$auth_profile" >/dev/null 2>&1; then
             verified=true
             new_status="active"
         fi
